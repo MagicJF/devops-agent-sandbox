@@ -986,6 +986,17 @@ function renderCatalog() {
   );
 }
 
+/**
+ * Solo se devuelve el foco si el cajón sigue abierto y el usuario no se ha
+ * ido a otra parte. Si no, el repintado se lo quitaría al botón que abrió el
+ * cajón o al que el usuario acaba de enfocar.
+ */
+function shouldRestoreFocus() {
+  if (!dom.drawer.classList.contains("is-open")) return false;
+  const active = document.activeElement;
+  return !active || active === document.body || dom.drawer.contains(active);
+}
+
 /** Recuerda qué botón de cantidad tenía el foco, para devolvérselo. */
 function readFocusTarget(element) {
   if (!element || !element.dataset) return null;
@@ -1265,12 +1276,12 @@ function onRemoveLine(productId, lineEl) {
     const finish = () => {
       if (rendered) return;
       rendered = true;
-      renderCart({ focusTarget });
+      renderCart({ focusTarget: shouldRestoreFocus() ? focusTarget : null });
     };
     lineEl.addEventListener("animationend", finish, { once: true });
     window.setTimeout(finish, 400); // red de seguridad si la animación no corre
   } else {
-    renderCart({ focusTarget });
+    renderCart({ focusTarget: shouldRestoreFocus() ? focusTarget : null });
   }
   popBadge();
 }
@@ -1291,10 +1302,14 @@ function onCheckout() {
   window.setTimeout(() => {
     state.cart = CartService.subtractLines(state.cart, { lines: sent }).cart;
     state.checkoutPending = false;
-    renderCart();
+    // Si queda algo, el cajón sigue abierto: hay que devolver el foco al botón
+    // que el usuario tuviera delante antes de repintar.
+    const staysOpen = state.cart.lines.length > 0;
+    const focusTarget = staysOpen ? readFocusTarget(document.activeElement) : null;
+    renderCart({ focusTarget });
     dom.checkout.classList.remove("is-done");
     dom.checkoutLabel.textContent = "Tramitar pedido";
-    if (state.cart.lines.length === 0) setDrawerOpen(false);
+    if (!staysOpen) setDrawerOpen(false);
   }, 1500);
 }
 
