@@ -411,7 +411,7 @@
     border-bottom: 1px solid var(--line);
     animation: line-in 320ms var(--ease-out) both;
   }
-  .line.is-leaving { animation: line-out 260ms var(--ease-out) both; }
+  .line.is-leaving { animation: line-out 260ms var(--ease-out) both; pointer-events: none; }
 
   .line__art {
     display: grid;
@@ -829,7 +829,12 @@ const CartService = {
     const lines = cart.lines.map((line) => ({ ...line }));
     const existing = lines.find((line) => line.productId === productId);
     if (existing) {
-      existing.qty = Math.min(existing.qty + qty, CONFIG.maxQtyPerLine);
+      const next = Math.min(existing.qty + qty, CONFIG.maxQtyPerLine);
+      // Si la línea ya está en el tope no ha cambiado nada: no es un alta.
+      if (next === existing.qty) {
+        return { ok: false, reason: "tope_de_linea", cart, productId };
+      }
+      existing.qty = next;
     } else {
       lines.push({ productId, qty: Math.min(qty, CONFIG.maxQtyPerLine) });
     }
@@ -859,6 +864,23 @@ const CartService = {
       return { ok: false, reason: "linea_inexistente", cart };
     }
     return { ok: true, cart: { lines }, removedProductId: productId };
+  },
+
+  /**
+   * Resta las unidades de una lista de líneas ya enviadas. Sirve para cerrar
+   * un pedido sin borrar lo que el usuario haya añadido mientras tanto.
+   */
+  subtractLines(cart, { lines: sent }) {
+    const lines = cart.lines.map((line) => ({ ...line }));
+    for (const gone of sent) {
+      const line = lines.find((l) => l.productId === gone.productId);
+      if (!line) continue;
+      line.qty -= gone.qty;
+      if (line.qty <= 0) {
+        lines.splice(lines.indexOf(line), 1);
+      }
+    }
+    return { ok: true, cart: { lines } };
   },
 
   /** Vacía el carrito. */
@@ -931,13 +953,12 @@ const dom = {
 
 const state = {
   cart: CartService.create(),
-  lastFocused: null
+  lastFocused: null,
+  checkoutPending: false
 };
 
-function productById(productId) {
-  const line = CartService.totals(state.cart).lines.find((l) => l.productId === productId);
-  return line ? line.product : null;
-}
+/** Elementos que quedan inactivos mientras el cajón está abierto. */
+const backdropTargets = [document.querySelector(".topbar"), document.querySelector("main"), document.querySelector(".footer")];
 
 /** Pinta el catálogo completo una sola vez. */
 function renderCatalog() {
@@ -965,8 +986,32 @@ function renderCatalog() {
   );
 }
 
+/** Recuerda qué botón de cantidad tenía el foco, para devolvérselo. */
+function readFocusTarget(element) {
+  if (!element || !element.dataset) return null;
+  if (element.dataset.inc) return { action: "inc", productId: element.dataset.inc };
+  if (element.dataset.dec) return { action: "dec", productId: element.dataset.dec };
+  return null;
+}
+
+/**
+ * Devuelve el foco al botón equivalente tras repintar, o al primer control que
+ * quede si esa línea ya no está. Sin esto, cambiar una cantidad con el teclado
+ * deja el foco en el cuerpo del documento.
+ */
+function restoreFocus(target) {
+  if (!target) return;
+  const selector = target.action === "inc"
+    ? `[data-inc="${target.productId}"]`
+    : `[data-dec="${target.productId}"]`;
+  const button = dom.lines.querySelector(selector)
+    || dom.lines.querySelector("[data-dec], [data-inc]")
+    || dom.cartClose;
+  if (button) button.focus({ preventScroll: true });
+}
+
 /** Pinta el carrito: líneas, totales y estado del botón de pago. */
-function renderCart() {
+function renderCart({ focusTarget = null } = {}) {
   const totals = CartService.totals(state.cart);
 
   dom.lines.replaceChildren(
@@ -1020,6 +1065,8 @@ function renderCart() {
   dom.badge.textContent = String(totals.count);
   dom.badgeWords.textContent = label;
 
+  restoreFocus(focusTarget);
+
   return totals;
 }
 
@@ -1050,11 +1097,14 @@ function ripple(button, event) {
 
 /**
  * La ficha del producto vuela hasta el botón del carrito, con una curva.
- * Sin soporte de Web Animations API simplemente no se dibuja: el carrito
- * ya se actualizó, así que la animación es adorno, no información.
+ * Devuelve false cuando no dibuja nada, para que quien llama pueda hacer otra
+ * cosa. Sin Web Animations API no hay vuelo, y quien pide menos movimiento
+ * tampoco lo ve: la regla CSS de `prefers-reduced-motion` no afecta a las
+ * animaciones creadas desde JavaScript, hay que comprobarlo aquí.
  */
 function flyToCart(sourceEl, artHtml) {
-  if (typeof sourceEl.animate !== "function") return;
+  if (typeof sourceEl.animate !== "function") return false;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return false;
 
   const start = sourceEl.getBoundingClientRect();
   const end = dom.cartOpen.getBoundingClientRect();
@@ -1087,6 +1137,7 @@ function flyToCart(sourceEl, artHtml) {
     popBadge();
   });
   flight.addEventListener("cancel", () => token.remove());
+  return true;
 }
 
 /** Confirmación breve sobre el botón que se acaba de pulsar. */
@@ -1109,11 +1160,23 @@ function toast(message) {
   }, 1900);
 }
 
-/** Abre y cierra el cajón, moviendo el foco a donde toca. */
+/**
+ * Abre y cierra el cajón. Mientras está abierto, el resto de la página queda
+ * inerte: fuera del orden de tabulación y del árbol de accesibilidad.
+ */
 function setDrawerOpen(open) {
   dom.drawer.classList.toggle("is-open", open);
   dom.overlay.classList.toggle("is-open", open);
   dom.cartOpen.setAttribute("aria-expanded", String(open));
+
+  backdropTargets.forEach((element) => {
+    if (!element) return;
+    if (open) {
+      element.setAttribute("inert", "");
+    } else {
+      element.removeAttribute("inert");
+    }
+  });
 
   if (open) {
     state.lastFocused = document.activeElement;
@@ -1124,15 +1187,39 @@ function setDrawerOpen(open) {
   }
 }
 
+/** Da vueltas dentro del cajón con el tabulador mientras está abierto. */
+function trapFocus(event) {
+  const focusables = [...dom.drawer.querySelectorAll(
+    "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])"
+  )];
+  if (focusables.length === 0) return;
+
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === dom.drawer)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 /* ==================================================================
    4. Capa de acciones: qué se hace y cuándo. Aquí viven las reglas de
    la interfaz, no los cálculos del carrito.
    ================================================================== */
 
 function onAddToCart(productId, button, event) {
+  const found = findProduct(productId);
+  const name = found.ok ? found.product.name : "Ese producto";
+
   const result = CartService.addLine(state.cart, { productId, qty: 1 });
   if (!result.ok) {
-    toast("No se pudo añadir ese producto.");
+    toast(result.reason === "tope_de_linea"
+      ? `${name}: el tope son ${CONFIG.maxQtyPerLine} unidades por línea.`
+      : "No se pudo añadir ese producto.");
     return;
   }
 
@@ -1140,29 +1227,26 @@ function onAddToCart(productId, button, event) {
   const card = button.closest(".card");
   const artEl = card ? card.querySelector(".card__art") : null;
   const artSvg = artEl ? artEl.querySelector("svg") : null;
-  const product = productById(productId);
 
   ripple(button, event);
   pulse(button);
 
-  if (artSvg) {
-    flyToCart(artEl, artSvg.outerHTML);
-  } else {
+  if (!artEl || !artSvg || !flyToCart(artEl, artSvg.outerHTML)) {
     popBadge();
   }
 
-  toast(`${product ? product.name : "Producto"} añadido`);
+  toast(`${name} añadido`);
   renderCart();
 }
 
-function onQuantityChange(productId, qty) {
+function onQuantityChange(productId, qty, button) {
   const result = CartService.setQuantity(state.cart, { productId, qty });
   if (!result.ok) {
     toast("Esa cantidad no vale.");
     return;
   }
   state.cart = result.cart;
-  renderCart();
+  renderCart({ focusTarget: readFocusTarget(button) });
 }
 
 function onRemoveLine(productId, lineEl) {
@@ -1170,31 +1254,54 @@ function onRemoveLine(productId, lineEl) {
   if (!result.ok) return;
 
   state.cart = result.cart;
+  // El foco hay que leerlo antes de desactivar nada.
+  const focusTarget = readFocusTarget(document.activeElement);
+
   if (lineEl && typeof lineEl.animate === "function") {
+    // La línea se va: sus botones dejan de responder en cuanto arranca la salida.
+    lineEl.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     lineEl.classList.add("is-leaving");
-    lineEl.addEventListener("animationend", () => renderCart(), { once: true });
-    window.setTimeout(renderCart, 400); // red de seguridad si la animación no corre
+    let rendered = false;
+    const finish = () => {
+      if (rendered) return;
+      rendered = true;
+      renderCart({ focusTarget });
+    };
+    lineEl.addEventListener("animationend", finish, { once: true });
+    window.setTimeout(finish, 400); // red de seguridad si la animación no corre
   } else {
-    renderCart();
+    renderCart({ focusTarget });
   }
   popBadge();
 }
 
 function onCheckout() {
   const totals = CartService.totals(state.cart);
-  if (totals.count === 0) return;
+  if (totals.count === 0 || state.checkoutPending) return;
+
+  // Lo que se envía queda aparte: si el usuario añade algo mientras el pedido
+  // se cierra, esa línea nueva no se borra.
+  const sent = state.cart.lines.map((line) => ({ ...line }));
+  state.checkoutPending = true;
 
   dom.checkout.classList.add("is-done");
   dom.checkoutLabel.textContent = `Pedido simulado · ${formatMoney(totals.totalCents)}`;
   toast("Pedido simulado. No hay cobro real.");
 
   window.setTimeout(() => {
-    state.cart = CartService.clear().cart;
+    state.cart = CartService.subtractLines(state.cart, { lines: sent }).cart;
+    state.checkoutPending = false;
     renderCart();
     dom.checkout.classList.remove("is-done");
     dom.checkoutLabel.textContent = "Tramitar pedido";
-    setDrawerOpen(false);
+    if (state.cart.lines.length === 0) setDrawerOpen(false);
   }, 1500);
+}
+
+/** Cantidad que hay ahora mismo de un producto. */
+function currentQty(productId) {
+  const line = CartService.totals(state.cart).lines.find((l) => l.productId === productId);
+  return line ? line.qty : 0;
 }
 
 /* ==================================================================
@@ -1211,19 +1318,16 @@ dom.lines.addEventListener("click", (event) => {
   const inc = event.target.closest("[data-inc]");
   const dec = event.target.closest("[data-dec]");
   if (inc) {
-    const id = inc.dataset.inc;
-    const line = CartService.totals(state.cart).lines.find((l) => l.productId === id);
-    onQuantityChange(id, (line ? line.qty : 0) + 1);
+    onQuantityChange(inc.dataset.inc, currentQty(inc.dataset.inc) + 1, inc);
     return;
   }
   if (dec) {
     const id = dec.dataset.dec;
-    const line = CartService.totals(state.cart).lines.find((l) => l.productId === id);
-    const next = (line ? line.qty : 0) - 1;
+    const next = currentQty(id) - 1;
     if (next <= 0) {
       onRemoveLine(id, dec.closest(".line"));
     } else {
-      onQuantityChange(id, next);
+      onQuantityChange(id, next, dec);
     }
   }
 });
@@ -1234,8 +1338,11 @@ dom.overlay.addEventListener("click", () => setDrawerOpen(false));
 dom.checkout.addEventListener("click", onCheckout);
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && dom.drawer.classList.contains("is-open")) {
+  if (!dom.drawer.classList.contains("is-open")) return;
+  if (event.key === "Escape") {
     setDrawerOpen(false);
+  } else if (event.key === "Tab") {
+    trapFocus(event);
   }
 });
 
